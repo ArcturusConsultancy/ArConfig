@@ -1,0 +1,14 @@
+.DS_Store
+
+# Local secrets
+.env
+*.env
+!.env.example
+backend/.credential-key
+
+# Generated/private runtime data
+backend/output/
+
+# Dependency and development caches
+node_modules/
+frontend/node_modules/.cache/

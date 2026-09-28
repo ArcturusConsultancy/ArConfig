@@ -28,6 +28,18 @@ function createProgressId() {
   return `run_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+async function downloadGeneratedFile(filename) {
+  const response = await axios.get(`/api/reports/${encodeURIComponent(filename)}`, { responseType: "blob" });
+  const objectUrl = window.URL.createObjectURL(response.data);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(objectUrl);
+}
+
 function App() {
   const [runs, setRuns] = useState([]);
   const [orgCodes, setOrgCodes] = useState("");
@@ -62,6 +74,7 @@ function App() {
   const [setupNote, setSetupNote] = useState("");
   const [extractionProgress, setExtractionProgress] = useState(null);
   const [snapshotCancelRequested, setSnapshotCancelRequested] = useState(false);
+  const [snapshotRunKind, setSnapshotRunKind] = useState("");
   const activeProgressIdRef = useRef("");
   const snapshotCancelRequestedRef = useRef(false);
 
@@ -363,6 +376,7 @@ function App() {
     }
 
     setLoading(true);
+    setSnapshotRunKind("area");
     setSnapshotCancelRequested(false);
     snapshotCancelRequestedRef.current = false;
     setMessage(null);
@@ -425,6 +439,80 @@ function App() {
     } finally {
       window.clearInterval(progressTimer);
       setLoading(false);
+      setSnapshotRunKind("");
+      setSnapshotCancelRequested(false);
+      snapshotCancelRequestedRef.current = false;
+      activeProgressIdRef.current = "";
+    }
+  };
+
+  const handleCompleteSetupRun = async () => {
+    if (!offering) {
+      setMessage({ type: "error", text: "Select one setup or All Setups first." });
+      return;
+    }
+
+    setLoading(true);
+    setSnapshotRunKind("complete");
+    setSnapshotCancelRequested(false);
+    snapshotCancelRequestedRef.current = false;
+    setMessage(null);
+    const progressId = createProgressId();
+    activeProgressIdRef.current = progressId;
+    setExtractionProgress({
+      id: progressId,
+      phase: "discovering",
+      totalTasks: 0,
+      completedCount: 0,
+      successCount: 0,
+      failedCount: 0,
+      percent: 0,
+      currentTask: null,
+      completedTasks: [],
+      message: `Loading all functional areas for ${offering.name}...`,
+    });
+    addLog(`Starting complete setup ZIP for ${offering.name}...`);
+
+    const pollProgress = async () => {
+      try {
+        const response = await axios.get(`/api/extraction/progress/${progressId}`);
+        setExtractionProgress(response.data);
+      } catch (error) {
+        if (error.response?.status !== 404) console.error("Failed to load extraction progress", error);
+      }
+    };
+    const progressTimer = window.setInterval(pollProgress, 1500);
+
+    try {
+      const response = await axios.post("/api/extraction/complete-setup", {
+        progressId,
+        orgCodes,
+        offering,
+      });
+      const run = response.data.run;
+      if (!snapshotCancelRequestedRef.current) {
+        const successText = `${run.taskCount} tasks and ${run.recordCount} records packaged into ${run.outputFile}.`;
+        setMessage({ type: run.status === "success" ? "success" : "error", text: successText });
+        addLog(successText, run.status === "success" ? "success" : "error");
+        await downloadGeneratedFile(run.outputFile);
+      }
+      await pollProgress();
+      await fetchHistory();
+    } catch (error) {
+      const errorText = error.response?.data?.error || error.message;
+      const cancelled = snapshotCancelRequestedRef.current || error.response?.data?.code === "EXTRACTION_CANCELLED";
+      setMessage({ type: cancelled ? "success" : "error", text: cancelled ? "Complete setup export cancelled." : errorText });
+      await pollProgress();
+      setExtractionProgress((current) => ({
+        ...current,
+        phase: cancelled ? "cancelled" : "failed",
+        message: cancelled ? "Complete setup export cancelled." : errorText,
+      }));
+      addLog(cancelled ? "Complete setup export cancelled by user." : `Complete setup export failed: ${errorText}`, cancelled ? "success" : "error");
+    } finally {
+      window.clearInterval(progressTimer);
+      setLoading(false);
+      setSnapshotRunKind("");
       setSnapshotCancelRequested(false);
       snapshotCancelRequestedRef.current = false;
       activeProgressIdRef.current = "";
@@ -597,7 +685,7 @@ function App() {
 
   const renderSnapshot = () => (
     <>
-      <div className="page-heading"><h1>Config Snapshot</h1><p>Select a setup, functional area, and export each selected task into its own workbook sheet.</p></div>
+      <div className="page-heading"><h1>Config Snapshot</h1><p>Export selected tasks to one workbook, or package a complete setup with every functional area into a ZIP.</p></div>
       <section className="panel-card">
         <div className="configuration-heading"><h2>Config Snapshot Setup</h2><div className="source-switch"><button type="button" className={taskSource === "area" ? "" : "outline-button"} onClick={() => handleTaskSourceChange("area")} disabled={loading || catalogLoading}>Browse Functional Areas</button><button type="button" className={taskSource === "search" ? "" : "outline-button"} onClick={() => handleTaskSourceChange("search")} disabled={loading || catalogLoading}>Search All Tasks</button></div></div>
         {taskSource === "area" ? (
@@ -615,10 +703,11 @@ function App() {
         {catalogLoading && <p className="helper-text">Loading Oracle setup metadata...</p>}
         {taskSource === "area" && setupNote && <p className="catalog-note">{setupNote}</p>}
         {catalogNote && <p className="catalog-note">{catalogNote}</p>}
+        {taskSource === "area" && offering && <p className="catalog-note"><strong>Complete setup export:</strong> Generate a ZIP containing one folder per setup and one Excel workbook per functional area. Each workbook contains its setup tasks and configuration data. Selecting All Setups creates all setup folders in one ZIP.</p>}
         <div className="task-heading"><div><h2>Tasks</h2><p>{selectedTasks.length} of {visibleTasks.length} selected</p></div><div className="task-heading-actions"><button className="outline-button compact-button" onClick={() => setSelectedTaskKeys([])} disabled={loading || !tasks.length || !selectedTaskKeys.length}>Clear Selection</button><button className="outline-button compact-button" onClick={() => selectTasksForMode(taskSource === "search" ? "all" : taskMode, tasks)} disabled={loading || !tasks.length}>Reset Selection</button></div></div>
         {renderTaskList()}
         <div className="field-group scope-field"><label>Organization scope (used by organization-scoped extractors)</label><div className="scope-selection-grid"><select value={organizationScopeType} onChange={(event) => setOrganizationScopeType(event.target.value)} disabled={loading}><option value="business">Business Organization</option><option value="inventory">Inventory Organization</option></select><input id="org-codes" value={orgCodes} onChange={(event) => setOrgCodes(event.target.value)} placeholder={organizationScopeType === "inventory" ? "ALL, Vision Operations, M1" : "ALL, Business Unit name or code"} disabled={loading} /></div><p className="helper-text">{organizationScopeType === "inventory" ? "Use Inventory Organization for Configure Subinventories and Facilities → Manage Inventory Organizations." : "Use Business Organization for business-unit scoped setup exports. Other FSM task exports use the scope available to your Fusion account."}</p></div>
-        <div className="button-row"><button className="outline-button" onClick={handleTestConnection} disabled={loading}>Test Connection</button><button onClick={handleRun} disabled={loading || catalogLoading || !selectedTasks.length}>{loading ? "Extracting Tasks..." : "Generate Combined Workbook"}</button><button className="outline-button" onClick={handleToggleHistory} disabled={loading}>{showHistory ? "Hide History" : "Run History"}</button></div>
+        <div className="button-row"><button className="outline-button" onClick={handleTestConnection} disabled={loading}>Test Connection</button><button onClick={handleRun} disabled={loading || catalogLoading || !selectedTasks.length}>{loading && snapshotRunKind === "area" ? "Extracting Tasks..." : "Generate Selected Workbook"}</button>{taskSource === "area" && <button onClick={handleCompleteSetupRun} disabled={loading || catalogLoading || !offering}>{loading && snapshotRunKind === "complete" ? "Building Complete ZIP..." : offering?.code === "ALL" ? "Generate All Setups ZIP" : "Generate Complete Setup ZIP"}</button>}{loading && <button className="danger-button" type="button" onClick={handleCancelSnapshot} disabled={snapshotCancelRequested}>{snapshotCancelRequested ? "Cancelling..." : "Cancel Task"}</button>}<button className="outline-button" onClick={handleToggleHistory} disabled={loading}>{showHistory ? "Hide History" : "Run History"}</button></div>
         {renderMessage()}
       </section>
       <section className="panel-card"><h2>Status</h2><div className="progress-track"><span style={{ width: `${extractionProgress?.percent ?? (latestRun ? 100 : 0)}%` }} /></div>{renderProgressStatus()}</section>

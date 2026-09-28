@@ -13,8 +13,10 @@ const {
   getHistory,
   getExtractionProgress,
 } = require("../controllers/extractionController");
+const { runCompleteSetupExtraction } = require("../controllers/completeSetupController");
 
 router.post("/run", runExtraction);
+router.post("/complete-setup", runCompleteSetupExtraction);
 router.post("/cancel/:progressId", cancelExtraction);
 router.get("/history", getHistory);
 router.get("/progress/:progressId", getExtractionProgress);

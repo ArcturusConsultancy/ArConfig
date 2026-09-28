@@ -11,8 +11,11 @@ const { AppError } = require("./errors");
 const { normalizeExtraction } = require("./normalizationService");
 const { getConfigurationItem } = require("./configurationRegistry");
 const { buildMigrationWorkbook } = require("./migrationReport");
-const { migrateConfiguration, validateMigration } = require("./oracleMigrationAdapter");
-const { parseWorkbookBuffer, sha256 } = require("./workbookImportService");
+const { validateMigration } = require("./oracleMigrationAdapter");
+const { readTaskPackage } = require("./oraclePackageStore");
+const { checkTaskImportSupported, importTaskPackage } = require("./setupTaskImportService");
+const { collectCsvFiles } = require("./taskExportService");
+const { parseWorkbookBuffer } = require("./workbookImportService");
 const MigrationPlan = require("./models/MigrationPlan");
 const RunHistory = require("./models/RunHistory");
 const { startMigrationProgress, updateMigrationProgress } = require("./migrationProgress");
@@ -48,7 +51,7 @@ async function listMigrationSources(ownerId) {
   const runs = await RunHistory.find({
     $or: [{ ownerId }, { ownerId: "" }],
     operation: "EXTRACT",
-    outputFile: { $ne: "" },
+    outputFile: { $regex: /\.xlsx$/i },
     status: { $in: ["success", "partial"] },
   }).sort({ createdAt: -1 }).limit(100);
   return runs.map((run) => ({
@@ -60,6 +63,7 @@ async function listMigrationSources(ownerId) {
     taskCount: run.taskCount,
     recordCount: run.recordCount,
     createdAt: run.createdAt,
+    automatedImportReady: Array.isArray(run.parameters?.oraclePackages) && run.parameters.oraclePackages.length > 0,
   }));
 }
 
@@ -86,13 +90,44 @@ async function loadExistingExtraction(ownerId, sourceRunId, context) {
     module: context.module || run.functionalAreaName,
     environmentName: run.sourceConnection?.name || "Existing Extraction",
   });
+  const oraclePackages = Array.isArray(run.parameters?.oraclePackages) ? run.parameters.oraclePackages : [];
+  let normalized = imported.normalized;
+  let sourceHash = imported.sourceHash;
+
+  // Automation-ready snapshots retain Oracle's original task ZIP. Normalize
+  // those source CSV files directly so the comparison uses the same raw shape
+  // as the live destination extraction. The generated Excel workbook contains
+  // presentation headings and summaries that must never become migration rows.
+  if (oraclePackages.length) {
+    const packagedTaskResults = [];
+    for (const packageInfo of oraclePackages) {
+      const packageBuffer = await readTaskPackage(packageInfo);
+      const files = await collectCsvFiles(packageBuffer);
+      const taskResult = (run.taskResults || []).find((task) =>
+        String(task.code || "").toUpperCase() === String(packageInfo.taskCode || "").toUpperCase()
+      );
+      packagedTaskResults.push({
+        code: packageInfo.taskCode,
+        name: packageInfo.taskName || taskResult?.name || packageInfo.taskCode,
+        status: "success",
+        files,
+      });
+    }
+    normalized = normalizeExtraction(packagedTaskResults, {
+      functionalArea: context.functionalArea || { name: run.functionalAreaName },
+      module: context.module || run.functionalAreaName,
+      environmentName: run.sourceConnection?.name || "Existing Extraction",
+    });
+    sourceHash = makeHash(oraclePackages.map((item) => ({ taskCode: item.taskCode, sha256: item.sha256 })));
+  }
   return {
     type: "EXTRACTION",
     id: run.id,
     label: run.outputFile,
-    sourceHash: imported.sourceHash,
-    normalized: imported.normalized,
+    sourceHash,
+    normalized,
     metadata: imported.metadata,
+    oraclePackages,
   };
 }
 
@@ -144,9 +179,36 @@ function operationFromComparison(result) {
   return "UNSUPPORTED";
 }
 
-async function buildOperations(comparison) {
+async function buildImportCapabilities(tasks, source, destinationClient) {
+  const capabilities = new Map();
+  for (const task of normalizeSelectedTasks(tasks)) {
+    const registry = getConfigurationItem(task);
+    const packageInfo = (source.oraclePackages || []).find((item) =>
+      String(item.taskCode || "").toUpperCase() === String(task.code || registry.id).toUpperCase()
+    );
+    let capability;
+    if (!packageInfo) {
+      capability = {
+        supported: false,
+        reason: source.type === "WORKBOOK"
+          ? "Automated Oracle import requires an Existing Extraction containing the original Oracle task package; uploaded Excel workbooks are preview-only."
+          : "This extraction does not contain the original Oracle task package. Generate a new Config Snapshot after deploying the migration automation update.",
+      };
+    } else {
+      const oracleSupport = await checkTaskImportSupported(destinationClient, task.code || packageInfo.taskCode);
+      capability = { ...oracleSupport, packageInfo, taskCode: task.code || packageInfo.taskCode, taskName: task.name };
+    }
+    for (const id of [registry.id, task.code, task.name]) {
+      if (id) capabilities.set(String(id).toUpperCase(), capability);
+    }
+  }
+  return capabilities;
+}
+
+async function buildOperations(comparison, importCapabilities = new Map()) {
   const operations = [];
   const blockingErrors = [];
+  const blockedItems = new Set();
   for (const [index, result] of comparison.results.entries()) {
     const desired = operationFromComparison(result);
     const registry = getConfigurationItem({ name: result.configurationName, code: result.configurationItem }, {
@@ -167,24 +229,85 @@ async function buildOperations(comparison) {
       reason: desired === "SKIP_DESTINATION_ONLY" ? "Destination-only record; deletes are disabled by default." : "",
       migrationSupported: registry.migrationSupported === true,
     };
-    const validation = await validateMigration(operation);
+    const capability = importCapabilities.get(String(result.configurationItem || "").toUpperCase())
+      || importCapabilities.get(String(result.configurationName || "").toUpperCase());
+    const validation = capability?.supported
+      ? { ok: true }
+      : capability
+        ? { ok: false, code: "MIGRATION_NOT_SUPPORTED", message: capability.reason }
+        : await validateMigration(operation);
     if (["CREATE", "UPDATE"].includes(desired) && !validation.ok) {
       operation.operation = "UNSUPPORTED";
       operation.reason = validation.message;
       operation.migrationSupported = false;
-      blockingErrors.push({
-        code: validation.code || "MIGRATION_NOT_SUPPORTED",
-        configurationItem: result.configurationItem,
-        configurationName: result.configurationName,
-        recordKey: result.recordKey,
-        message: validation.message,
-      });
+      const blockerKey = String(result.configurationItem || result.configurationName);
+      if (!blockedItems.has(blockerKey)) {
+        blockedItems.add(blockerKey);
+        blockingErrors.push({
+          code: validation.code || "MIGRATION_NOT_SUPPORTED",
+          configurationItem: result.configurationItem,
+          configurationName: result.configurationName,
+          recordKey: result.recordKey,
+          message: validation.message,
+        });
+      }
+    } else if (["CREATE", "UPDATE"].includes(desired) && capability?.supported) {
+      operation.migrationSupported = true;
+      operation.importTaskCode = capability.taskCode;
+      operation.importTaskName = capability.taskName;
     }
     operations.push(operation);
   }
   operations.sort((left, right) => (left.dependencyOrder - right.dependencyOrder)
     || String(left.configurationName).localeCompare(String(right.configurationName))
     || String(left.recordKey).localeCompare(String(right.recordKey)));
+  return { operations, blockingErrors };
+}
+
+function buildPackageFallbackOperations(tasks, importCapabilities, extractionFailures) {
+  const operations = [];
+  const blockingErrors = [];
+  for (const [index, task] of normalizeSelectedTasks(tasks).entries()) {
+    const capability = importCapabilities.get(String(task.code || "").toUpperCase())
+      || importCapabilities.get(String(task.name || "").toUpperCase());
+    if (!capability?.supported || !capability.packageInfo) {
+      const message = capability?.reason || `Oracle import support could not be verified for ${task.name}.`;
+      blockingErrors.push({
+        code: "MIGRATION_NOT_SUPPORTED",
+        configurationItem: task.code,
+        configurationName: task.name,
+        message,
+      });
+      operations.push({
+        id: `package-${index}`,
+        operation: "UNSUPPORTED",
+        configurationItem: task.code,
+        configurationName: task.name,
+        dataset: "Oracle setup task package",
+        recordKey: task.code,
+        changes: [],
+        dependencyOrder: 100,
+        reason: message,
+        migrationSupported: false,
+      });
+      continue;
+    }
+    operations.push({
+      id: `package-${index}`,
+      operation: "UPDATE",
+      configurationItem: task.code,
+      configurationName: task.name,
+      dataset: "Oracle setup task package",
+      recordKey: task.code,
+      changes: [],
+      dependencyOrder: 100,
+      reason: "Destination record preview was unavailable. Oracle will validate and import the original task package as one guarded operation.",
+      migrationSupported: true,
+      importTaskCode: capability.taskCode,
+      importTaskName: capability.taskName,
+      destinationExtractionFailures: extractionFailures,
+    });
+  }
   return { operations, blockingErrors };
 }
 
@@ -224,6 +347,7 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
     module: String(body.module || body.functionalArea?.name || ""),
     orgCodes: parseOrgCodes(body.orgCodes),
     allowDelete: false,
+    allowRevisionMismatch: body.allowRevisionMismatch === true,
   };
   const destination = await authenticatedConnection(ownerId, body.destinationConnectionId, baseCfg);
   const isProd = String(destination.connection.environmentType || "").toUpperCase() === "PROD";
@@ -235,6 +359,12 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
       message: "Production migration is blocked in this phase. Validate in DEV/SIT/UAT first and add explicit production approval controls before enabling execution.",
     });
   }
+  if (isProd && context.allowRevisionMismatch) {
+    blockingErrors.push({
+      code: "PRODUCTION_MIGRATION_UNAUTHORIZED",
+      message: "Oracle revision-mismatch override is not permitted for production destinations.",
+    });
+  }
 
   const source = sourceBuffer
     ? await loadUploadedWorkbook(sourceBuffer, { filename: sourceFilename }, context)
@@ -244,26 +374,61 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
   const sourceItems = filterRecords(source.normalized.items, selectedIds);
   if (!sourceItems.length) throw new AppError("INVALID_MIGRATION_SOURCE", "The source does not contain records for the selected configuration items.");
 
+  const importCapabilities = await buildImportCapabilities(tasks, source, destination.client);
+
   const destinationExtraction = await extractConfigurationItems({
     client: destination.client,
-    cfg: destination.cfg,
+    cfg: context.allowRevisionMismatch && !isProd
+      ? { ...destination.cfg, taskExportTimeoutMs: Math.min(destination.cfg.taskExportTimeoutMs, 120000) }
+      : destination.cfg,
     tasks,
     orgCodes: context.orgCodes.length ? context.orgCodes : destination.cfg.orgCodes,
   });
-  const targetNormalized = normalizeExtraction(destinationExtraction.taskResults, {
-    functionalArea: context.functionalArea,
-    module: context.module,
-    environmentName: destination.connection.name,
-  });
-  const targetItems = filterRecords(targetNormalized.items, selectedIds);
-  const comparison = compareConfigurations(sourceItems, targetItems);
-  warnings.push(
-    ...source.normalized.warnings.map((warning) => ({ ...warning, side: "SOURCE" })),
-    ...targetNormalized.warnings.map((warning) => ({ ...warning, side: "DESTINATION" })),
-    ...comparison.warnings
-  );
-  const planned = await buildOperations(comparison);
+  const destinationFailures = destinationExtraction.taskResults.filter((task) => task.status === "failed");
+  const destinationFailureDetails = destinationFailures.map((task) => ({
+      code: task.code,
+      name: task.name,
+      errorMessage: task.errorMessage,
+  }));
+  if (destinationFailures.length && (!context.allowRevisionMismatch || isProd)) {
+    throw new AppError(
+      "DESTINATION_EXTRACTION_FAILED",
+      `Destination extraction failed for ${destinationFailures.length} configuration item(s). Migration was not planned because missing destination data could be misclassified as CREATE.`,
+      destinationFailureDetails
+    );
+  }
+  let targetItems = [];
+  let planned;
+  if (destinationFailures.length) {
+    warnings.push({
+      code: "DESTINATION_PREVIEW_UNAVAILABLE",
+      side: "DESTINATION",
+      message: `Destination export remained unavailable for ${destinationFailures.length} configuration item(s). Using guarded Oracle task-package import because the non-production revision override was explicitly enabled.`,
+      details: destinationFailureDetails,
+    });
+    planned = buildPackageFallbackOperations(tasks, importCapabilities, destinationFailureDetails);
+  } else {
+    const targetNormalized = normalizeExtraction(destinationExtraction.taskResults, {
+      functionalArea: context.functionalArea,
+      module: context.module,
+      environmentName: destination.connection.name,
+    });
+    targetItems = filterRecords(targetNormalized.items, selectedIds);
+    const comparison = compareConfigurations(sourceItems, targetItems);
+    warnings.push(
+      ...source.normalized.warnings.map((warning) => ({ ...warning, side: "SOURCE" })),
+      ...targetNormalized.warnings.map((warning) => ({ ...warning, side: "DESTINATION" })),
+      ...comparison.warnings
+    );
+    planned = await buildOperations(comparison, importCapabilities);
+  }
   blockingErrors.push(...planned.blockingErrors);
+  const summary = summarizeOperations(planned.operations);
+  const planStatus = blockingErrors.length
+    ? "BLOCKED"
+    : summary.create + summary.update > 0
+      ? "READY"
+      : "COMPLETED";
   const planHash = makeHash({
     sourceHash: source.sourceHash,
     destinationId: destination.connection.id,
@@ -279,8 +444,8 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
   });
   const plan = await MigrationPlan.create({
     ownerId,
-    status: blockingErrors.length ? "BLOCKED" : "READY",
-    source: { type: source.type, id: source.id || "", label: source.label, metadata: source.metadata },
+    status: planStatus,
+    source: { type: source.type, id: source.id || "", label: source.label, metadata: source.metadata, oraclePackages: source.oraclePackages || [] },
     destination: {
       id: destination.connection.id,
       name: destination.connection.name,
@@ -298,7 +463,7 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
       extractionTaskCount: destinationExtraction.taskResults.length,
       extractionFailures: destinationExtraction.taskResults.filter((task) => task.status === "failed").map((task) => ({ code: task.code, name: task.name, errorMessage: task.errorMessage })),
     },
-    summary: summarizeOperations(planned.operations),
+    summary,
     operations: planned.operations,
     warnings,
     blockingErrors,
@@ -325,7 +490,7 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
     taskCount: tasks.length,
     recordCount: sourceItems.length,
     outputFile: plan.reportFile,
-    status: plan.status === "READY" ? "success" : "failed",
+    status: ["READY", "COMPLETED"].includes(plan.status) ? "success" : "failed",
     errorMessage: blockingErrors.length ? `${blockingErrors.length} blocking migration validation errors.` : null,
   });
   plan.historyRunId = history.id;
@@ -345,46 +510,92 @@ async function executeMigrationPlan({ ownerId, planId, confirmationText }) {
   if (confirmationText !== expectedText) {
     throw new AppError("MIGRATION_VALIDATION_FAILED", `Type exactly "${expectedText}" to execute this migration.`);
   }
-  const executable = plan.operations.filter((operation) => ["CREATE", "UPDATE"].includes(operation.operation));
-  if (!executable.length) throw new AppError("MIGRATION_NOT_SUPPORTED", "This plan has no executable migration operations. Add item-specific Oracle migration handlers first.");
+  const executable = plan.operations.filter((operation) => ["CREATE", "UPDATE"].includes(operation.operation) && operation.importTaskCode);
+  if (!executable.length) {
+    throw new AppError(
+      "MIGRATION_NOT_SUPPORTED",
+      "This plan has no executable Oracle imports. Use an Automation ready extraction and select a task that Oracle reports as CSV-import supported."
+    );
+  }
+  if (String(plan.destination.environmentType || "").toUpperCase() === "PROD" && plan.context?.allowRevisionMismatch) {
+    throw new AppError(
+      "PRODUCTION_MIGRATION_UNAUTHORIZED",
+      "Oracle revision-mismatch override is not permitted for production destinations."
+    );
+  }
   plan.status = "RUNNING";
   plan.startedAt = new Date();
   await plan.save();
-  startMigrationProgress(plan.id, { phase: "running", totalItems: executable.length, message: "Executing migration operations..." });
+  const grouped = new Map();
+  for (const operation of executable) {
+    const key = String(operation.importTaskCode).toUpperCase();
+    const group = grouped.get(key) || [];
+    group.push(operation);
+    grouped.set(key, group);
+  }
+  const taskGroups = Array.from(grouped.entries());
+  startMigrationProgress(plan.id, { phase: "running", totalItems: taskGroups.length, message: "Importing Oracle setup task packages..." });
   const baseCfg = loadConfig();
   const destination = await authenticatedConnection(ownerId, plan.destination.id, baseCfg);
   const executionResults = [];
-  for (const [index, operation] of executable.entries()) {
+  for (const [index, [taskCode, operations]] of taskGroups.entries()) {
     try {
-      const idempotencyKey = sha256(Buffer.from(`${plan.planHash}:${operation.configurationItem}:${operation.dataset}:${operation.recordKey}`));
-      const result = await migrateConfiguration({ operation, client: destination.client, cfg: destination.cfg, idempotencyKey });
-      executionResults.push({ ...operation, status: "SUCCESS", result });
+      const packageInfo = (plan.source?.oraclePackages || []).find((item) => String(item.taskCode || "").toUpperCase() === taskCode);
+      if (!packageInfo) throw new Error(`The original Oracle package for ${taskCode} is unavailable.`);
+      const packageBuffer = await readTaskPackage(packageInfo);
+      const result = await importTaskPackage(destination.client, destination.cfg, taskCode, packageBuffer, {
+        allowRevisionMismatch: plan.context?.allowRevisionMismatch === true,
+        onStatus: ({ processId, status }) => updateMigrationProgress(plan.id, {
+          currentItem: operations[0]?.configurationName || taskCode,
+          oracleProcessId: processId,
+          oracleStatus: status,
+          message: `Oracle import for ${operations[0]?.configurationName || taskCode}: ${status}`,
+        }),
+      });
+      executionResults.push(...operations.map((operation) => ({ ...operation, status: "SUCCESS", result: { processId: result.processId, status: result.status } })));
     } catch (error) {
-      executionResults.push({ ...operation, status: "FAILED", errorCode: error.code || "MIGRATION_EXECUTION_FAILED", errorMessage: error.message });
+      executionResults.push(...operations.map((operation) => ({ ...operation, status: "FAILED", errorCode: error.code || "MIGRATION_EXECUTION_FAILED", errorMessage: error.message })));
     }
     updateMigrationProgress(plan.id, {
       completedItems: index + 1,
-      successfulItems: executionResults.filter((item) => item.status === "SUCCESS").length,
-      failedItems: executionResults.filter((item) => item.status === "FAILED").length,
+      successfulItems: taskGroups.slice(0, index + 1).filter(([code]) => executionResults.some((item) => String(item.importTaskCode).toUpperCase() === code && item.status === "SUCCESS")).length,
+      failedItems: taskGroups.slice(0, index + 1).filter(([code]) => executionResults.some((item) => String(item.importTaskCode).toUpperCase() === code && item.status === "FAILED")).length,
     });
   }
   const failed = executionResults.filter((item) => item.status === "FAILED").length;
+  const succeeded = executionResults.filter((item) => item.status === "SUCCESS").length;
   plan.executionResults = executionResults;
   plan.summary = summarizeOperations(plan.operations, { failed });
-  plan.status = failed ? "PARTIALLY_COMPLETED" : "COMPLETED";
+  plan.status = failed === 0
+    ? "COMPLETED"
+    : succeeded > 0
+      ? "PARTIALLY_COMPLETED"
+      : "FAILED";
   plan.completedAt = new Date();
   await writePlanReport(plan);
   await plan.save();
   await RunHistory.updateOne({ _id: plan.historyRunId, ownerId }, {
     lifecycleStatus: plan.status,
-    status: failed ? "partial" : "success",
+    status: plan.status === "COMPLETED" ? "success" : plan.status === "PARTIALLY_COMPLETED" ? "partial" : "failed",
     resultSummary: plan.summary,
     outputFile: plan.reportFile,
     completedAt: plan.completedAt,
     errorMessage: failed ? `${failed} migration operations failed.` : null,
   }).catch(() => {});
-  await writeAudit({ ownerId, action: failed ? "MIGRATION_PARTIAL" : "MIGRATION_COMPLETED", metadata: { migrationId: plan.id, summary: plan.summary, outputFile: plan.reportFile } });
-  updateMigrationProgress(plan.id, { phase: plan.status.toLowerCase(), message: failed ? "Migration completed with failures." : "Migration completed." });
+  const auditAction = plan.status === "COMPLETED"
+    ? "MIGRATION_COMPLETED"
+    : plan.status === "PARTIALLY_COMPLETED"
+      ? "MIGRATION_PARTIAL"
+      : "MIGRATION_FAILED";
+  await writeAudit({ ownerId, action: auditAction, status: plan.status, metadata: { migrationId: plan.id, summary: plan.summary, outputFile: plan.reportFile } });
+  updateMigrationProgress(plan.id, {
+    phase: plan.status.toLowerCase(),
+    message: plan.status === "COMPLETED"
+      ? "Migration completed successfully in Oracle."
+      : plan.status === "PARTIALLY_COMPLETED"
+        ? "Migration completed with some failed operations."
+        : "Migration failed; Oracle did not complete any import operation.",
+  });
   return plan;
 }
 

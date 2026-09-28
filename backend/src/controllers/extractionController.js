@@ -16,6 +16,7 @@ const RunHistory = require("../models/RunHistory");
 const logger = require("../logger");
 const { getSession } = require("../sessionStore");
 const { writeAudit } = require("../auditService");
+const { storeTaskPackages } = require("../oraclePackageStore");
 const {
   beginTask,
   cancelProgress,
@@ -76,6 +77,7 @@ async function runTaskExtraction({ client, runCfg, req, res, startedAt }) {
   const succeeded = taskResults.filter((task) => task.status === "success").length;
   const status = succeeded === taskResults.length ? "success" : succeeded > 0 ? "partial" : "failed";
   const recordCount = taskResults.reduce((total, task) => total + task.recordCount, 0);
+  const oraclePackages = await storeTaskPackages(taskResults, progressId || Date.now());
   const filename = `ConfigSnapshot_${sanitizeFilenamePart(functionalArea.name)}_${Date.now()}.xlsx`;
   const outputPath = path.join(__dirname, "..", "..", "output", filename);
 
@@ -109,7 +111,7 @@ async function runTaskExtraction({ client, runCfg, req, res, startedAt }) {
     lifecycleStatus: "COMPLETED",
     requestedBy: runCfg.username,
     configurationItems: selectedTasks.map((task) => task.code || task.name),
-    parameters: { orgCodes: resolvedOrgCodes },
+    parameters: { orgCodes: resolvedOrgCodes, oraclePackages },
     startedAt,
     completedAt: new Date(),
     durationMs: Date.now() - startedAt.getTime(),

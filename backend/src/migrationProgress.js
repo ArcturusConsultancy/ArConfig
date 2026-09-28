@@ -10,6 +10,7 @@ function startMigrationProgress(id, seed = {}) {
     failedItems: 0,
     message: "Preparing migration validation...",
     items: [],
+    startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...seed,
   };

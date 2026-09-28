@@ -47,7 +47,7 @@ const RunHistorySchema = new mongoose.Schema({
   subinventoryCount: { type: Number, default: 0 },
   locatorCount: { type: Number, default: 0 },
   outputFile: { type: String, default: "" },
-  status: { type: String, enum: ["success", "partial", "failed"], required: true },
+  status: { type: String, enum: ["success", "partial", "failed", "cancelled"], required: true },
   errorMessage: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
 }, {

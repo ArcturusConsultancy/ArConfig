@@ -11,6 +11,7 @@ const TRANSIENT_NETWORK_CODES = new Set([
   "EAI_AGAIN",
   "ETIMEDOUT",
 ]);
+const activeExports = new Map();
 
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -220,16 +221,29 @@ async function downloadTaskExport(client, task, resultPath) {
     throw new Error(`Oracle returned no CSV data files for ${task.name}.`);
   }
 
-  return files;
+  return { files, packageBuffer: zipBuffer };
 }
 
-async function exportTaskCsv(client, cfg, task) {
+async function runTaskExport(client, cfg, task) {
   logger.info(`Starting setup task export: ${task.name} (${task.code})`);
   const processId = await startTaskExport(client, task);
   const process = await pollTaskExport(client, cfg, task, processId);
-  const files = await downloadTaskExport(client, task, process.resultPath);
+  const { files, packageBuffer } = await downloadTaskExport(client, task, process.resultPath);
   logger.info(`Setup task export completed: ${task.name} (${files.length} CSV files)`);
-  return { ...task, processId, files };
+  return { ...task, processId, files, packageBuffer };
+}
+
+async function exportTaskCsv(client, cfg, task) {
+  const exportKey = [cfg.baseUrl, cfg.username, task.code].map((value) => String(value || "").toUpperCase()).join("|");
+  const active = activeExports.get(exportKey);
+  if (active) {
+    logger.info(`Reusing active setup task export for ${task.name}; no duplicate Oracle process will be created.`);
+    return active;
+  }
+
+  const pending = runTaskExport(client, cfg, task).finally(() => activeExports.delete(exportKey));
+  activeExports.set(exportKey, pending);
+  return pending;
 }
 
 module.exports = {
