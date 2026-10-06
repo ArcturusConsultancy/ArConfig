@@ -59,6 +59,16 @@ function MigrationView({ offerings, addLog, refreshHistory, onOpenSettings }) {
   const previewRows = (plan?.operations || []).slice(0, 600);
   const actionCount = count(plan, "create") + count(plan, "update");
   const noChanges = Boolean(plan && !blockers.length && actionCount === 0);
+  const executionFailed = ["FAILED", "PARTIALLY_COMPLETED"].includes(plan?.status);
+  const executionCompleted = plan?.status === "COMPLETED" && Boolean(plan?.executionResults?.length);
+  const summaryItems = [
+    [executionFailed || executionCompleted ? "Planned Create" : "Create", count(plan, "create"), "create"],
+    [executionFailed || executionCompleted ? "Planned Update" : "Update", count(plan, "update"), "update"],
+    ["Unchanged", count(plan, "noChange"), "unchanged"],
+    ["Skipped", count(plan, "skip"), "skipped"],
+    ["Unsupported", count(plan, "unsupported"), "unsupported"],
+    ...(count(plan, "failed") ? [["Failed", count(plan, "failed"), "failed"]] : []),
+  ];
 
   useEffect(() => {
     axios.get("/api/environments").then((response) => setConnections(response.data.connections || []))
@@ -329,11 +339,21 @@ function MigrationView({ offerings, addLog, refreshHistory, onOpenSettings }) {
       {plan && (
         <>
           <section className="comparison-summary migration-summary">
-            {[["Create", count(plan, "create")], ["Update", count(plan, "update")], ["Unchanged", count(plan, "noChange")], ["Skipped", count(plan, "skip")], ["Unsupported", count(plan, "unsupported")]].map(([label, value]) => <article className={`summary-${label.toLowerCase()}`} key={label}><span>{label}</span><strong>{value}</strong></article>)}
+            {summaryItems.map(([label, value, style]) => <article className={`summary-${style}`} key={label}><span>{label}</span><strong>{value}</strong></article>)}
           </section>
           <section className="panel-card">
             <h2>Validation Results</h2>
-            <div className={blockers.length ? "status-fail" : "status-ok"}>{blockers.length ? `${blockers.length} blocking issue(s). Execution disabled.` : noChanges ? "No changes detected. Source and destination already match." : "Ready to migrate after confirmation."}</div>
+            <div className={blockers.length || executionFailed ? "status-fail" : "status-ok"}>
+              {executionFailed
+                ? `Migration execution ${plan.status === "PARTIALLY_COMPLETED" ? "partially completed" : "failed"} in Oracle. Review the error above and the Oracle Details report before validating again.`
+                : executionCompleted
+                  ? "Migration completed successfully in Oracle."
+                  : blockers.length
+                    ? `${blockers.length} blocking issue(s). Execution disabled.`
+                    : noChanges
+                      ? "No changes detected. Source and destination already match."
+                      : "Ready to migrate after confirmation."}
+            </div>
             {warnings.length > 0 && <p className="catalog-note">{warnings.length} warning(s). See the Excel report for full details.</p>}
             {blockers.slice(0, 8).map((error, index) => <p className="migration-error" key={`${error.code}-${index}`}><strong>{error.code}</strong>: {error.configurationName ? `${error.configurationName} — ` : ""}{error.message}</p>)}
           </section>
@@ -341,7 +361,7 @@ function MigrationView({ offerings, addLog, refreshHistory, onOpenSettings }) {
             <h2>Config Migration Preview</h2>
             <div className="history-wrap"><table className="history-table comparison-table"><thead><tr><th>Operation</th><th>Configuration</th><th>Dataset</th><th>Record Key</th><th>Changes</th><th>Reason</th></tr></thead><tbody>{previewRows.map((row) => <tr key={row.id}><td><span className={`diff-status diff-${row.operation.toLowerCase().replace(/_/g, "-")}`}>{row.operation}</span></td><td>{row.configurationName}</td><td>{row.dataset}</td><td>{row.recordKey}</td><td>{row.changes?.length || 0}</td><td>{row.reason || "—"}</td></tr>)}</tbody></table></div>
           </section>
-          {!noChanges && (
+          {!noChanges && plan.status === "READY" && (
             <section className="panel-card">
               <h2>Execution Confirmation</h2>
               <p className="helper-text">Execution is server-side guarded, reuses the immutable plan, and is disabled when Oracle does not support CSV import for a selected task. To execute a ready plan, type: <strong>{exactConfirmation}</strong></p>

@@ -1221,6 +1221,7 @@ select:focus {
 .summary-update { border-top: 3px solid #b7791f !important; }
 .summary-skipped { border-top: 3px solid #245b89 !important; }
 .summary-unsupported { border-top: 3px solid #b42318 !important; }
+.summary-failed { border-top: 3px solid #b42318 !important; }
 .diff-modified { background: #fff8c5; color: #9a6700; }
 .diff-added { background: #edf8f0; color: #16833a; }
 .diff-create { background: #edf8f0; color: #16833a; }

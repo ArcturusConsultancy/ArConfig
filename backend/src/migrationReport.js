@@ -153,7 +153,28 @@ async function buildMigrationWorkbook({ plan, outputPath }) {
   addTable(workbook.addWorksheet("CREATED"), "Records To Create", ["Configuration Item", "Record Key", "Operation", "Dataset", "Field", "Destination Value", "Source Value", "Reason"], operationRows(plan, ["CREATE"]));
   addTable(workbook.addWorksheet("UPDATED"), "Records To Update", ["Configuration Item", "Record Key", "Operation", "Dataset", "Field", "Current Value", "New Value", "Reason"], operationRows(plan, ["UPDATE"]));
   addTable(workbook.addWorksheet("SKIPPED"), "Skipped / Unchanged Records", ["Configuration Item", "Record Key", "Operation", "Dataset", "Field", "Destination Value", "Source Value", "Reason"], operationRows(plan, ["NO_CHANGE", "SKIP_DESTINATION_ONLY"]));
-  addTable(workbook.addWorksheet("FAILED"), "Failed Operations", ["Configuration Item", "Record Key", "Operation", "Error Code", "Error Message"], (plan.executionResults || []).filter((item) => item.status === "FAILED").map((item) => [item.configurationName, item.recordKey, item.operation, item.errorCode, item.errorMessage]));
+  const failedItems = (plan.executionResults || []).filter((item) => item.status === "FAILED");
+  addTable(workbook.addWorksheet("FAILED"), "Failed Operations", ["Configuration Item", "Record Key", "Operation", "Error Code", "Error Message", "Oracle Process ID", "Oracle Status"], failedItems.map((item) => [item.configurationName, item.recordKey, item.operation, item.errorCode, item.errorMessage, item.oracleProcessId || "", item.oracleStatus || ""]));
+  const oracleReports = [];
+  const seenReports = new Set();
+  for (const item of failedItems) {
+    for (const report of item.oracleReports || []) {
+      const key = `${item.importTaskCode || item.configurationName}:${item.oracleProcessId || ""}:${report.name}`;
+      if (seenReports.has(key)) continue;
+      seenReports.add(key);
+      oracleReports.push([
+        item.configurationName,
+        item.importTaskCode || "",
+        item.oracleProcessId || "",
+        item.oracleStatus || "",
+        report.name || "",
+        report.text || "Binary Oracle report captured; use the encoded content if detailed inspection is required.",
+      ]);
+    }
+  }
+  if (oracleReports.length) {
+    addTable(workbook.addWorksheet("ORACLE DETAILS"), "Oracle Import Diagnostics", ["Configuration Item", "Task Code", "Process ID", "Oracle Status", "Report", "Details"], oracleReports);
+  }
   addTable(workbook.addWorksheet("VERIFICATION"), "Post-Migration Verification", ["Configuration Item", "Record Key", "Expected Value", "Actual Value", "Verification Status"], (plan.verification?.results || []).map((item) => [item.configurationName, item.recordKey, item.expectedValue || "", item.actualValue || "", item.status]));
 
   const unsupported = operationRows(plan, ["UNSUPPORTED"]);

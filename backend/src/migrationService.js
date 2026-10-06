@@ -81,23 +81,15 @@ async function loadExistingExtraction(ownerId, sourceRunId, context) {
     outputFile: { $ne: "" },
   });
   if (!run) throw new AppError("INVALID_MIGRATION_SOURCE", "Select a valid extraction run owned by this user.");
-  const filePath = outputPathFor(run.outputFile);
-  const buffer = await fs.readFile(filePath).catch(() => null);
-  if (!buffer) throw new AppError("INVALID_MIGRATION_SOURCE", "The selected extraction workbook is no longer available on disk.");
-  const imported = await parseWorkbookBuffer(buffer, {
-    filename: run.outputFile,
-    functionalArea: context.functionalArea || { name: run.functionalAreaName },
-    module: context.module || run.functionalAreaName,
-    environmentName: run.sourceConnection?.name || "Existing Extraction",
-  });
   const oraclePackages = Array.isArray(run.parameters?.oraclePackages) ? run.parameters.oraclePackages : [];
-  let normalized = imported.normalized;
-  let sourceHash = imported.sourceHash;
+  let normalized;
+  let sourceHash;
+  let metadata;
 
   // Automation-ready snapshots retain Oracle's original task ZIP. Normalize
   // those source CSV files directly so the comparison uses the same raw shape
-  // as the live destination extraction. The generated Excel workbook contains
-  // presentation headings and summaries that must never become migration rows.
+  // as the live destination extraction. Do not parse the generated presentation
+  // workbook first: its headings and summaries are not migration input tables.
   if (oraclePackages.length) {
     const packagedTaskResults = [];
     for (const packageInfo of oraclePackages) {
@@ -119,6 +111,25 @@ async function loadExistingExtraction(ownerId, sourceRunId, context) {
       environmentName: run.sourceConnection?.name || "Existing Extraction",
     });
     sourceHash = makeHash(oraclePackages.map((item) => ({ taskCode: item.taskCode, sha256: item.sha256 })));
+    metadata = {
+      sourceType: "ORACLE_TASK_PACKAGES",
+      packageCount: oraclePackages.length,
+      recordCount: normalized.items.length,
+      warnings: normalized.warnings,
+    };
+  } else {
+    const filePath = outputPathFor(run.outputFile);
+    const buffer = await fs.readFile(filePath).catch(() => null);
+    if (!buffer) throw new AppError("INVALID_MIGRATION_SOURCE", "The selected extraction workbook is no longer available on disk.");
+    const imported = await parseWorkbookBuffer(buffer, {
+      filename: run.outputFile,
+      functionalArea: context.functionalArea || { name: run.functionalAreaName },
+      module: context.module || run.functionalAreaName,
+      environmentName: run.sourceConnection?.name || "Existing Extraction",
+    });
+    normalized = imported.normalized;
+    sourceHash = imported.sourceHash;
+    metadata = imported.metadata;
   }
   return {
     type: "EXTRACTION",
@@ -126,7 +137,7 @@ async function loadExistingExtraction(ownerId, sourceRunId, context) {
     label: run.outputFile,
     sourceHash,
     normalized,
-    metadata: imported.metadata,
+    metadata,
     oraclePackages,
   };
 }
@@ -177,6 +188,22 @@ function operationFromComparison(result) {
   if (result.status === "UNCHANGED") return "NO_CHANGE";
   if (result.status === "ADDED") return "SKIP_DESTINATION_ONLY";
   return "UNSUPPORTED";
+}
+
+function duplicateKeyBlockingErrors(warnings = []) {
+  return warnings
+    .filter((warning) => warning.code === "DUPLICATE_COMPARISON_KEY")
+    .map((warning) => {
+      const [configurationItem = "", dataset = "", ...recordKeyParts] = String(warning.key || "").split("::");
+      return {
+        code: "DUPLICATE_COMPARISON_KEY",
+        configurationItem,
+        configurationName: configurationItem,
+        dataset,
+        recordKey: recordKeyParts.join("::"),
+        message: `${warning.message} Migration is blocked because this record cannot be matched safely until its business key is unique.`,
+      };
+    });
 }
 
 async function buildImportCapabilities(tasks, source, destinationClient) {
@@ -420,6 +447,7 @@ async function createMigrationPlan({ ownerId, requestedBy, body, sourceBuffer, s
       ...targetNormalized.warnings.map((warning) => ({ ...warning, side: "DESTINATION" })),
       ...comparison.warnings
     );
+    blockingErrors.push(...duplicateKeyBlockingErrors(comparison.warnings));
     planned = await buildOperations(comparison, importCapabilities);
   }
   blockingErrors.push(...planned.blockingErrors);
@@ -554,7 +582,24 @@ async function executeMigrationPlan({ ownerId, planId, confirmationText }) {
       });
       executionResults.push(...operations.map((operation) => ({ ...operation, status: "SUCCESS", result: { processId: result.processId, status: result.status } })));
     } catch (error) {
-      executionResults.push(...operations.map((operation) => ({ ...operation, status: "FAILED", errorCode: error.code || "MIGRATION_EXECUTION_FAILED", errorMessage: error.message })));
+      const oracleResult = error.details || {};
+      executionResults.push(...operations.map((operation, operationIndex) => ({
+        ...operation,
+        status: "FAILED",
+        errorCode: error.code || "MIGRATION_EXECUTION_FAILED",
+        errorMessage: operationIndex === 0
+          ? error.message
+          : `Oracle task package ${taskCode} failed; see the first failed row for the detailed Oracle message.`,
+        oracleProcessId: oracleResult.processId || null,
+        oracleStatus: oracleResult.status || null,
+        oracleReports: operationIndex === 0 ? oracleResult.reports || [] : [],
+      })));
+      updateMigrationProgress(plan.id, {
+        currentItem: operations[0]?.configurationName || taskCode,
+        oracleProcessId: oracleResult.processId,
+        oracleStatus: oracleResult.status || "FAILED",
+        message: error.message,
+      });
     }
     updateMigrationProgress(plan.id, {
       completedItems: index + 1,
@@ -599,4 +644,4 @@ async function executeMigrationPlan({ ownerId, planId, confirmationText }) {
   return plan;
 }
 
-module.exports = { createMigrationPlan, executeMigrationPlan, listMigrationSources };
+module.exports = { createMigrationPlan, duplicateKeyBlockingErrors, executeMigrationPlan, listMigrationSources };

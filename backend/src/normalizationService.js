@@ -8,10 +8,13 @@ function normalizeHeader(value, index) {
   return String(value ?? "").trim() || `Column ${index + 1}`;
 }
 
-function rowObject(headers, row) {
+function rowObject(headers, row, ignoredFields = []) {
   const result = {};
+  const ignored = new Set(ignoredFields);
   headers.forEach((header, index) => {
-    if (!AUDIT_FIELDS.test(header) && !SENSITIVE_FIELDS.test(header)) result[header] = row?.[index] ?? "";
+    if (!AUDIT_FIELDS.test(header) && !SENSITIVE_FIELDS.test(header) && !ignored.has(header)) {
+      result[header] = row?.[index] ?? "";
+    }
   });
   return result;
 }
@@ -37,13 +40,14 @@ function normalizeTaskResult(taskResult, context = {}) {
     const table = Array.isArray(file.rows) ? file.rows : [];
     if (!table.length) continue;
     const headers = table[0].map(normalizeHeader);
-    const registryItem = getConfigurationItem(taskResult, context, headers);
+    const dataset = String(file.name || "Data").replace(/\.csv$/i, "");
+    const registryItem = getConfigurationItem(taskResult, { ...context, dataset }, headers);
     for (const rawRow of table.slice(1)) {
-      const fields = rowObject(headers, rawRow);
+      const fields = rowObject(headers, rawRow, registryItem.ignoredFields);
       records.push({
         configurationItem: registryItem.id,
         configurationName: registryItem.displayName,
-        dataset: String(file.name || "Data").replace(/\.csv$/i, ""),
+        dataset,
         recordKey: keyFor(fields, registryItem.comparisonKeys),
         businessUnit: fields["Business Unit"] || fields["Organization Code"] || fields.Organization || "",
         fields,
